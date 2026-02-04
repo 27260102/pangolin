@@ -1,8 +1,9 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,17 +12,16 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	lark "github.com/larksuite/oapi-sdk-go/v3"
+	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 )
 
 type FeishuHandler struct {
 	cfg      Config
 	manager  *SessionManager
-	client   *http.Client
 	projects *ProjectStore
-
-	tokenMu sync.Mutex
-	token   string
-	expire  int64
+	sdk      *lark.Client
 
 	dedupMu sync.Mutex
 	dedup   map[string]time.Time
@@ -31,6 +31,10 @@ type FeishuHandler struct {
 
 	pendingMu     sync.Mutex
 	pendingByUser map[string]string
+
+	modelMu      sync.Mutex
+	modelCache   []string
+	modelCacheAt time.Time
 }
 
 func NewFeishuHandler(cfg Config, manager *SessionManager, projects *ProjectStore) *FeishuHandler {
@@ -38,99 +42,38 @@ func NewFeishuHandler(cfg Config, manager *SessionManager, projects *ProjectStor
 		cfg:           cfg,
 		manager:       manager,
 		projects:      projects,
-		client:        &http.Client{Timeout: 10 * time.Second},
+		sdk:           lark.NewClient(cfg.FeishuAppID, cfg.FeishuAppSecret),
 		dedup:         map[string]time.Time{},
 		chatThread:    map[string]string{},
 		pendingByUser: map[string]string{},
 	}
 }
 
-func (h *FeishuHandler) getTenantToken() (string, error) {
-	h.tokenMu.Lock()
-	defer h.tokenMu.Unlock()
-	if h.token != "" && h.expire-60 > time.Now().Unix() {
-		return h.token, nil
-	}
-	if h.cfg.FeishuAppID == "" || h.cfg.FeishuAppSecret == "" {
-		return "", errInternal
-	}
-
-	url := h.cfg.FeishuAPIBase + "/auth/v3/tenant_access_token/internal"
-	payload := map[string]any{"app_id": h.cfg.FeishuAppID, "app_secret": h.cfg.FeishuAppSecret}
-	b, _ := json.Marshal(payload)
-	resp, err := h.client.Post(url, "application/json", bytes.NewReader(b))
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	var data map[string]any
-	_ = json.NewDecoder(resp.Body).Decode(&data)
-	if code, ok := data["code"].(float64); ok && int(code) != 0 {
-		return "", errInternal
-	}
-	if t, ok := data["tenant_access_token"].(string); ok {
-		if exp, ok := data["expire"].(float64); ok {
-			h.token = t
-			h.expire = time.Now().Unix() + int64(exp)
-		}
-		return t, nil
-	}
-	return "", errInternal
-}
-
 func (h *FeishuHandler) replyText(messageID, text string) error {
-	token, err := h.getTenantToken()
+	req := larkim.NewReplyMessageReqBuilder().
+		MessageId(messageID).
+		Body(larkim.NewReplyMessageReqBodyBuilder().
+			MsgType("text").
+			Content(mustJSON(map[string]string{"text": text})).
+			ReplyInThread(false).
+			Build()).
+		Build()
+	resp, err := h.sdk.Im.V1.Message.Reply(context.Background(), req)
 	if err != nil {
 		return err
 	}
-	url := h.cfg.FeishuAPIBase + "/im/v1/messages/" + messageID + "/reply"
-	payload := map[string]any{
-		"msg_type": "text",
-		"content":  mustJSON(map[string]string{"text": text}),
-	}
-	b, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", url, bytes.NewReader(b))
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := h.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	var data map[string]any
-	_ = json.NewDecoder(resp.Body).Decode(&data)
-	if code, ok := data["code"].(float64); ok && int(code) != 0 {
-		log.Printf("Feishu reply error: %+v", data)
+	if !resp.Success() {
+		log.Printf("Feishu reply error: code=%v msg=%v req=%v", resp.Code, resp.Msg, resp.RequestId())
 	}
 	return nil
 }
 
 func (h *FeishuHandler) sendText(chatID, text string) error {
-	token, err := h.getTenantToken()
-	if err != nil {
-		return err
-	}
-	url := h.cfg.FeishuAPIBase + "/im/v1/messages?receive_id_type=chat_id"
-	payload := map[string]any{
+	return h.sendMessage("chat_id", map[string]any{
 		"receive_id": chatID,
 		"msg_type":   "text",
 		"content":    mustJSON(map[string]string{"text": text}),
-	}
-	b, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", url, bytes.NewReader(b))
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := h.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	var data map[string]any
-	_ = json.NewDecoder(resp.Body).Decode(&data)
-	if code, ok := data["code"].(float64); ok && int(code) != 0 {
-		log.Printf("Feishu send error: %+v", data)
-	}
-	return nil
+	})
 }
 
 func (h *FeishuHandler) isDuplicate(eventID string) bool {
@@ -344,6 +287,13 @@ func (h *FeishuHandler) handleCardAction(eventType, token, userID, chatID string
 
 	actionName, _ := value["action"].(string)
 	page := intFromAny(value["page"])
+	refreshCard := true
+	toastType := "success"
+	toastText := "已更新"
+
+	if actionName == "set_model" {
+		return h.handleSetModel(userID, chatID, value, eventType)
+	}
 
 	switch actionName {
 	case "load_more":
@@ -367,6 +317,8 @@ func (h *FeishuHandler) handleCardAction(eventType, token, userID, chatID string
 	case "resume":
 		id := int64FromAny(value["project_id"])
 		h.handleResumeProject(userID, chatID, id, token)
+		refreshCard = false
+		toastText = "已切换"
 	case "delete":
 		id := int64FromAny(value["project_id"])
 		_ = h.projects.Delete(userID, id)
@@ -399,6 +351,9 @@ func (h *FeishuHandler) handleCardAction(eventType, token, userID, chatID string
 		}
 		if chatID != "" && threadID != "" {
 			h.setChatThread(chatID, threadID)
+			if h.projects != nil && userID != "" {
+				_ = h.projects.UpsertChatThread(chatID, userID, threadID)
+			}
 		}
 	case "bind":
 		cwd := ""
@@ -427,16 +382,24 @@ func (h *FeishuHandler) handleCardAction(eventType, token, userID, chatID string
 		}
 		if chatID != "" && threadID != "" {
 			h.setChatThread(chatID, threadID)
+			if h.projects != nil && userID != "" {
+				_ = h.projects.UpsertChatThread(chatID, userID, threadID)
+			}
 		}
 	}
 
+	if !refreshCard {
+		return map[string]any{
+			"toast": map[string]any{"type": toastType, "content": toastText},
+		}
+	}
 	if eventType == "card.action.trigger" {
 		go h.sendProjectCard(userID, page)
 		return map[string]any{
-			"toast": map[string]any{"type": "success", "content": "已更新"},
+			"toast": map[string]any{"type": toastType, "content": toastText},
 		}
 	}
-	return h.cardResp("success", "已更新", h.buildProjectCard(userID, page), eventType)
+	return h.cardResp(toastType, toastText, h.buildProjectCard(userID, page), eventType)
 }
 
 func (h *FeishuHandler) cardResp(toastType, toast string, card map[string]any, eventType string) map[string]any {
@@ -498,41 +461,7 @@ func (h *FeishuHandler) handleMessageEvent(event map[string]any) {
 	content, _ := message["content"].(string)
 	senderID := GetSenderID(event)
 
-	log.Printf("[feishu] message_id=%s chat_id=%s", messageID, chatID)
-	log.Printf("[feishu] raw content=%s", content)
-	if messageID == "" || chatID == "" {
-		return
-	}
-
-	var contentObj map[string]any
-	_ = json.Unmarshal([]byte(content), &contentObj)
-	text, _ := contentObj["text"].(string)
-	text = strings.TrimSpace(text)
-	log.Printf("[feishu] parsed text='%s'", text)
-	if text == "" {
-		return
-	}
-
-	threadID := h.getOrCreateThread(chatID)
-	if threadID == "" {
-		log.Printf("[feishu] failed to get thread for chat_id=%s", chatID)
-		return
-	}
-	session, ok := h.manager.GetThread(threadID)
-	if !ok || session == nil {
-		log.Printf("[feishu] thread not found for chat_id=%s thread_id=%s", chatID, threadID)
-		return
-	}
-	if session.AutoAllowTools == nil || len(session.AutoAllowTools) == 0 {
-		if session.AutoAllowTools == nil {
-			session.AutoAllowTools = map[string]struct{}{}
-		}
-		for _, t := range ParseAllowedTools(h.cfg.AutoAllowTools) {
-			session.AutoAllowTools[t] = struct{}{}
-		}
-	}
-
-	_ = h.processAndReply(threadID, messageID, chatID, senderID, text)
+	h.handleIncomingMessage(messageID, chatID, content, senderID)
 }
 
 func (h *FeishuHandler) handleMenuEvent(event map[string]any) {
@@ -550,6 +479,16 @@ func (h *FeishuHandler) handleMenuEvent(event map[string]any) {
 	}
 
 	log.Printf("[feishu] menu event_key=%s user_id=%s open_id=%s", eventKey, userID, openID)
+	h.handleMenuEventKey(userID, openID, eventKey)
+}
+
+func (h *FeishuHandler) handleMenuEventKey(userID, openID, eventKey string) {
+	if userID == "" {
+		userID = openID
+	}
+	if userID == "" || eventKey == "" {
+		return
+	}
 
 	if h.cfg.FeishuMenuProjectsKey != "" && eventKey == h.cfg.FeishuMenuProjectsKey {
 		if err := h.sendProjectCard(userID, 0); err != nil {
@@ -616,6 +555,190 @@ func (h *FeishuHandler) handleMenuEvent(event map[string]any) {
 	}
 }
 
+func (h *FeishuHandler) handleIncomingMessage(messageID, chatID, content, senderID string) {
+	log.Printf("[feishu] message_id=%s chat_id=%s", messageID, chatID)
+	log.Printf("[feishu] raw content=%s", content)
+	if messageID == "" || chatID == "" {
+		return
+	}
+
+	var contentObj map[string]any
+	_ = json.Unmarshal([]byte(content), &contentObj)
+	text, _ := contentObj["text"].(string)
+	text = strings.TrimSpace(text)
+	log.Printf("[feishu] parsed text='%s'", text)
+	if text == "" {
+		return
+	}
+
+	threadID := h.getOrCreateThread(chatID)
+	if threadID == "" {
+		log.Printf("[feishu] failed to get thread for chat_id=%s", chatID)
+		return
+	}
+	if h.projects != nil && senderID != "" {
+		_ = h.projects.UpsertChatThread(chatID, senderID, threadID)
+	}
+	session, ok := h.manager.GetThread(threadID)
+	if !ok || session == nil {
+		log.Printf("[feishu] thread not found for chat_id=%s thread_id=%s", chatID, threadID)
+		return
+	}
+	if session.AutoAllowTools == nil || len(session.AutoAllowTools) == 0 {
+		if session.AutoAllowTools == nil {
+			session.AutoAllowTools = map[string]struct{}{}
+		}
+		for _, t := range ParseAllowedTools(h.cfg.AutoAllowTools) {
+			session.AutoAllowTools[t] = struct{}{}
+		}
+	}
+
+	if strings.HasPrefix(text, "/") {
+		if h.handleSlashCommand(session, threadID, messageID, chatID, senderID, text) {
+			return
+		}
+	}
+
+	_ = h.processAndReply(threadID, messageID, chatID, senderID, text)
+}
+
+func (h *FeishuHandler) handleSlashCommand(session *Session, threadID, messageID, chatID, userID, text string) bool {
+	parts := strings.Fields(text)
+	if len(parts) == 0 {
+		return false
+	}
+	switch parts[0] {
+	case "/model":
+		if chatID == "" {
+			model := session.Config.Model
+			if model == "" {
+				model = "default"
+			}
+			if messageID != "" {
+				_ = h.replyText(messageID, fmt.Sprintf("当前模型：%s", model))
+			}
+			return true
+		}
+		card := h.buildModelCard(session.Config.Model, h.getModelOptions())
+		_ = h.sendModelCard(chatID, card)
+		return true
+	case "/compact":
+		if chatID == "" || threadID == "" {
+			return true
+		}
+		if messageID != "" {
+			_ = h.replyText(messageID, "正在压缩会话，请稍候…")
+		} else {
+			_ = h.sendText(chatID, "正在压缩会话，请稍候…")
+		}
+
+		summary, err := h.compactSession(threadID, session)
+		if err != nil || strings.TrimSpace(summary) == "" {
+			if messageID != "" {
+				_ = h.replyText(messageID, "压缩失败，请稍后再试。")
+			} else {
+				_ = h.sendText(chatID, "压缩失败，请稍后再试。")
+			}
+			return true
+		}
+
+		newID, err := h.createCompactedThread(session, summary)
+		if err != nil {
+			if messageID != "" {
+				_ = h.replyText(messageID, "压缩失败，请稍后再试。")
+			} else {
+				_ = h.sendText(chatID, "压缩失败，请稍后再试。")
+			}
+			return true
+		}
+
+		if newID != "" && newID != threadID {
+			if h.projects != nil {
+				if p, err := h.projects.GetByThreadID(threadID); err == nil && p != nil {
+					_, _ = h.projects.UpsertProject(p.UserID, p.Name, p.Cwd, newID)
+				}
+				if userID != "" {
+					_ = h.projects.UpsertChatThread(chatID, userID, newID)
+				}
+			}
+			h.setChatThread(chatID, newID)
+			_ = h.manager.ArchiveThread(threadID)
+		}
+
+		_ = h.sendText(chatID, "已压缩，会话已更新。")
+		return true
+	default:
+		if messageID != "" {
+			_ = h.replyText(messageID, "当前模式仅支持 /model 和 /compact。")
+		} else if chatID != "" {
+			_ = h.sendText(chatID, "当前模式仅支持 /model 和 /compact。")
+		}
+		return true
+	}
+}
+
+func (h *FeishuHandler) compactSession(threadID string, session *Session) (string, error) {
+	prompt := "请将我们到目前为止的对话压缩成一份精简摘要，保留：目标、已完成工作、关键决定、待办与约束。请用中文条目化输出，尽量短。"
+	resp, err := h.manager.SendMessage(threadID, prompt)
+	if err != nil {
+		return "", err
+	}
+	if v, ok := resp["response"].(string); ok {
+		return v, nil
+	}
+	return "", errInternal
+}
+
+func (h *FeishuHandler) createCompactedThread(session *Session, summary string) (string, error) {
+	cfg := session.Config
+	base := strings.TrimSpace(cfg.System)
+	summary = strings.TrimSpace(summary)
+	if base != "" {
+		cfg.System = base + "\n\n以下为此前对话的精简摘要，可作为后续上下文：\n" + summary
+	} else {
+		cfg.System = "以下为此前对话的精简摘要，可作为后续上下文：\n" + summary
+	}
+	thread, err := h.manager.CreateThread(cfg)
+	if err != nil {
+		return "", err
+	}
+	id := thread["thread"].(map[string]any)["id"].(string)
+	return id, nil
+}
+
+func (h *FeishuHandler) handleSetModel(userID, chatID string, value map[string]any, eventType string) map[string]any {
+	model := strFromAny(value["model"])
+	if model == "" || chatID == "" {
+		return map[string]any{
+			"toast": map[string]any{"type": "error", "content": "缺少模型或会话信息"},
+		}
+	}
+	threadID := h.getOrCreateThread(chatID)
+	if threadID == "" {
+		return map[string]any{
+			"toast": map[string]any{"type": "error", "content": "会话不可用"},
+		}
+	}
+	session, ok := h.manager.GetThread(threadID)
+	if !ok || session == nil {
+		return map[string]any{
+			"toast": map[string]any{"type": "error", "content": "会话不可用"},
+		}
+	}
+
+	oldModel := session.Config.Model
+	session.Config.Model = model
+	if err := h.manager.RestartThread(threadID, session.PermissionMode); err != nil {
+		session.Config.Model = oldModel
+		return map[string]any{
+			"toast": map[string]any{"type": "error", "content": "切换失败，请重试"},
+		}
+	}
+
+	card := h.buildModelCard(session.Config.Model, h.getModelOptions())
+	return h.cardResp("success", "已切换模型", card, eventType)
+}
+
 func (h *FeishuHandler) processAndReply(threadID, messageID, chatID, senderID, text string) error {
 	session, _ := h.manager.GetThread(threadID)
 	process, _ := h.manager.GetProcess(threadID)
@@ -624,6 +747,7 @@ func (h *FeishuHandler) processAndReply(threadID, messageID, chatID, senderID, t
 
 	session.LastUserMessage = text
 	if err := process.SendMessage(text); err != nil {
+		log.Printf("[feishu] send to claude failed: %v", err)
 		return err
 	}
 
@@ -642,6 +766,14 @@ func (h *FeishuHandler) processAndReply(threadID, messageID, chatID, senderID, t
 				_ = h.sendText(chatID, "超时：Claude 没有在预期时间内返回。")
 			}
 			return nil
+		}
+		if h.cfg.DebugEvents {
+			method, _ := ev["method"].(string)
+			paramsKeys := []string{}
+			if params, ok := ev["params"].(map[string]any); ok {
+				paramsKeys = keys(params)
+			}
+			log.Printf("[feishu] event method=%s keys=%v params_keys=%v", method, keys(ev), paramsKeys)
 		}
 		if ev["method"] == "item/agentMessage/delta" {
 			params, _ := ev["params"].(map[string]any)
@@ -775,18 +907,63 @@ func (h *FeishuHandler) handleResumeProject(userID, chatID string, projectID int
 	if err != nil {
 		return
 	}
-	_, _ = h.manager.ResumeThread(p.ThreadID)
-	if chatID != "" {
-		h.setChatThread(chatID, p.ThreadID)
+	threadID := p.ThreadID
+	if _, err := h.manager.ResumeThread(threadID); err != nil {
+		if errors.Is(err, errNotFound) {
+			cfg := ThreadConfig{Cwd: p.Cwd, Tools: "default", PermissionMode: "acceptEdits"}
+			if _, resumeErr := h.manager.ResumeThreadWithConfig(threadID, cfg); resumeErr == nil {
+				// resumed using persisted session id
+			} else {
+				newID, createErr := h.handleCreateProject(userID, p.Name, p.Cwd, token)
+				if createErr != nil {
+					log.Printf("[feishu] resume project failed: %v", createErr)
+					return
+				}
+				threadID = newID
+			}
+		} else {
+			newID, createErr := h.handleCreateProject(userID, p.Name, p.Cwd, token)
+			if createErr != nil {
+				log.Printf("[feishu] resume project failed: %v", createErr)
+				return
+			}
+			threadID = newID
+		}
+	}
+	if chatID != "" && threadID != "" {
+		h.setChatThread(chatID, threadID)
+		if h.projects != nil && userID != "" {
+			_ = h.projects.UpsertChatThread(chatID, userID, threadID)
+		}
 		_ = h.sendText(chatID, fmt.Sprintf("已切换到项目：【%s】 路径：%s", p.Name, p.Cwd))
 	}
 }
 
 func (h *FeishuHandler) getOrCreateThread(chatID string) string {
 	h.chatThreadMu.Lock()
-	defer h.chatThreadMu.Unlock()
 	if id, ok := h.chatThread[chatID]; ok {
+		h.chatThreadMu.Unlock()
 		return id
+	}
+	h.chatThreadMu.Unlock()
+
+	if h.projects != nil {
+		if threadID, userID, err := h.projects.GetChatThread(chatID); err == nil && threadID != "" {
+			cfg := ThreadConfig{PermissionMode: "acceptEdits"}
+			if p, err := h.projects.GetByThreadID(threadID); err == nil && p != nil {
+				cfg.Cwd = p.Cwd
+				cfg.Tools = "default"
+			}
+			if _, err := h.manager.ResumeThreadWithConfig(threadID, cfg); err == nil {
+				h.chatThreadMu.Lock()
+				h.chatThread[chatID] = threadID
+				h.chatThreadMu.Unlock()
+				if userID != "" {
+					_ = h.projects.UpsertChatThread(chatID, userID, threadID)
+				}
+				return threadID
+			}
+		}
 	}
 	thread, err := h.manager.CreateThread(ThreadConfig{PermissionMode: "acceptEdits"})
 	if err != nil {
@@ -1086,36 +1263,26 @@ func (h *FeishuHandler) buildProjectFormCard(userID string, page int, mode strin
 }
 
 func (h *FeishuHandler) sendMessage(receiveType string, payload map[string]any) error {
-	token, err := h.getTenantToken()
+	receiveID, _ := payload["receive_id"].(string)
+	msgType, _ := payload["msg_type"].(string)
+	content, _ := payload["content"].(string)
+	if receiveID == "" || msgType == "" {
+		return errInternal
+	}
+	req := larkim.NewCreateMessageReqBuilder().
+		ReceiveIdType(receiveType).
+		Body(larkim.NewCreateMessageReqBodyBuilder().
+			ReceiveId(receiveID).
+			MsgType(msgType).
+			Content(content).
+			Build()).
+		Build()
+	resp, err := h.sdk.Im.V1.Message.Create(context.Background(), req)
 	if err != nil {
 		return err
 	}
-	url := h.cfg.FeishuAPIBase + "/im/v1/messages?receive_id_type=" + receiveType
-	return h.postJSONWithAuth(url, payload, token)
-}
-
-func (h *FeishuHandler) postJSON(url string, payload map[string]any) error {
-	token, err := h.getTenantToken()
-	if err != nil {
-		return err
-	}
-	return h.postJSONWithAuth(url, payload, token)
-}
-
-func (h *FeishuHandler) postJSONWithAuth(url string, payload map[string]any, token string) error {
-	b, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", url, bytes.NewReader(b))
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := h.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	var data map[string]any
-	_ = json.NewDecoder(resp.Body).Decode(&data)
-	if code, ok := data["code"].(float64); ok && int(code) != 0 {
-		log.Printf("[feishu] post error url=%s code=%v msg=%v", url, data["code"], data["msg"])
+	if !resp.Success() {
+		log.Printf("[feishu] send error code=%v msg=%v req=%v", resp.Code, resp.Msg, resp.RequestId())
 	}
 	return nil
 }

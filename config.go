@@ -12,6 +12,7 @@ type Config struct {
 	FeishuVerificationToken string
 	FeishuEncryptKey        string
 	FeishuAPIBase           string
+	FeishuEventMode         string
 
 	FeishuStreamMode     string
 	FeishuStreamInterval float64
@@ -25,6 +26,7 @@ type Config struct {
 
 	AutoAllowTools string
 	ProjectDBPath  string
+	DebugEvents    bool
 }
 
 func LoadConfig() Config {
@@ -34,6 +36,7 @@ func LoadConfig() Config {
 		FeishuVerificationToken: strings.TrimSpace(os.Getenv("FEISHU_VERIFICATION_TOKEN")),
 		FeishuEncryptKey:        strings.TrimSpace(os.Getenv("FEISHU_ENCRYPT_KEY")),
 		FeishuAPIBase:           envDefault("FEISHU_API_BASE", "https://open.feishu.cn/open-apis"),
+		FeishuEventMode:         strings.ToLower(envDefault("FEISHU_EVENT_MODE", "ws")),
 
 		FeishuStreamMode:     strings.ToLower(envDefault("FEISHU_STREAM_MODE", "merge")),
 		FeishuStreamInterval: envFloat("FEISHU_STREAM_INTERVAL", 1.2),
@@ -48,6 +51,7 @@ func LoadConfig() Config {
 		AutoAllowTools: envDefault("AUTO_ALLOW_TOOLS",
 			"Read;Search;List;Glob;Bash(ls:*);Bash(pwd);Bash(cat:*);Bash(head:*);Bash(tail:*);Bash(wc:*);Bash(stat:*);Bash(git:status,git:diff)"),
 		ProjectDBPath: envDefault("PROJECT_DB_PATH", "./projects.db"),
+		DebugEvents:   envBool("PANGOLIN_DEBUG_EVENTS", false),
 	}
 }
 
@@ -81,4 +85,19 @@ func envFloat(key string, def float64) float64 {
 		return def
 	}
 	return n
+}
+
+func envBool(key string, def bool) bool {
+	val := strings.TrimSpace(os.Getenv(key))
+	if val == "" {
+		return def
+	}
+	switch strings.ToLower(val) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		return def
+	}
 }

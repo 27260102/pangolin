@@ -44,6 +44,17 @@ export FEISHU_VERIFICATION_TOKEN=xxx
 export FEISHU_API_BASE=https://open.feishu.cn/open-apis
 ```
 
+### 事件接入模式（推荐 WebSocket）
+
+默认使用 SDK 的 WebSocket 长连接，不需要暴露公网回调地址：
+
+```bash
+# ws: SDK WebSocket（默认）
+# http: 传统回调 URL
+# both: 同时开启
+export FEISHU_EVENT_MODE=ws
+```
+
 ### 机器人菜单事件（推荐）
 
 使用“推送事件”的菜单来审批（不污染聊天记录），请配置机器人自定义菜单并将事件 key 写入环境变量：
@@ -116,16 +127,27 @@ export PROJECT_DB_PATH=./projects.db
 
 ### 事件订阅
 
+若使用 HTTP 回调模式（`FEISHU_EVENT_MODE=http` 或 `both`）：
+
 - 回调 URL: `https://你的域名/feishu/events`
 - 订阅事件：`im.message.receive_v1`
 - 订阅事件（菜单审批）：`application.bot.menu_v6`
 - 校验方式：Verification Token（与 `FEISHU_VERIFICATION_TOKEN` 一致）
 
+若使用 WebSocket 模式（默认）：
+
+- 在飞书应用后台启用事件订阅的长连接/Socket 方式
+- 勾选 `im.message.receive_v1`、`application.bot.menu_v6` 等事件
+- 无需填写公网回调 URL
+
 ### 卡片回调
 
-项目管理卡片需要配置回调地址：
+若使用 HTTP 回调模式，项目管理卡片需要配置回调地址：
+
 - 回调 URL: `https://你的域名/feishu/callback`
 - 回调类型：卡片交互（action trigger）
+
+WebSocket 模式无需配置卡片回调地址。
 
 ### 需要的权限（最小集合）
 

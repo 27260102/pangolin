@@ -8,6 +8,8 @@ import (
 	"sync"
 )
 
+var debugClaude = envBool("PANGOLIN_DEBUG_CLAUDE", false)
+
 type ClaudeProcessManager struct {
 	sessionID string
 	config    ThreadConfig
@@ -142,6 +144,9 @@ func (p *ClaudeProcessManager) readStdout() {
 		line = trimSpace(line)
 		if line == "" {
 			continue
+		}
+		if debugClaude {
+			log.Printf("[claude stdout] %s", line)
 		}
 		var event map[string]any
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
@@ -301,9 +306,15 @@ func (p *ClaudeProcessManager) SendMessage(message string) error {
 	p.sawStreamDelta = false
 	input := map[string]any{
 		"type":    "user",
-		"message": map[string]any{"role": "user", "content": message},
+		"message": map[string]any{
+			"role":    "user",
+			"content": []any{map[string]any{"type": "text", "text": message}},
+		},
 	}
 	b, _ := json.Marshal(input)
+	if debugClaude {
+		log.Printf("[claude stdin] %s", string(b))
+	}
 	_, err := p.stdin.Write(append(b, '\n'))
 	if err != nil {
 		return err

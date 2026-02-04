@@ -151,6 +151,42 @@ func (m *SessionManager) ResumeThread(id string) (map[string]any, error) {
 	return map[string]any{"thread": map[string]any{"id": id, "preview": s.Preview, "model": s.Config.Model, "createdAt": s.CreatedAt}}, nil
 }
 
+func (m *SessionManager) ResumeThreadWithConfig(id string, cfg ThreadConfig) (map[string]any, error) {
+	m.mu.Lock()
+	s, ok := m.sessions[id]
+	m.mu.Unlock()
+	if ok {
+		return m.ResumeThread(id)
+	}
+
+	pm := NewClaudeProcessManager(id, cfg)
+	if err := pm.Start(true); err != nil {
+		return nil, err
+	}
+
+	perm := cfg.PermissionMode
+	if perm == "" {
+		perm = "acceptEdits"
+	}
+	s = &Session{
+		Config:             cfg,
+		CreatedAt:          time.Now().Unix(),
+		Preview:            "",
+		PermissionMode:     perm,
+		BasePermissionMode: perm,
+		AutoAllowTools:     map[string]struct{}{},
+		PendingApproval:    nil,
+		LastUserMessage:    "",
+	}
+
+	m.mu.Lock()
+	m.sessions[id] = s
+	m.processes[id] = pm
+	m.mu.Unlock()
+
+	return map[string]any{"thread": map[string]any{"id": id, "preview": s.Preview, "model": s.Config.Model, "createdAt": s.CreatedAt}}, nil
+}
+
 func (m *SessionManager) ArchiveThread(id string) error {
 	m.mu.Lock()
 	p, ok := m.processes[id]

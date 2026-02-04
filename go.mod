@@ -2,14 +2,20 @@ module pangolin
 
 go 1.22
 
-require github.com/gorilla/websocket v1.5.1
+require (
+	github.com/gorilla/websocket v1.5.1
+	github.com/larksuite/oapi-sdk-go/v3 v3.5.3
+)
 
 require modernc.org/sqlite v1.33.1
 
 require github.com/google/uuid v1.6.0
 
+replace github.com/larksuite/oapi-sdk-go/v3 => ../oapi-sdk-go
+
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/ncruces/go-strftime v0.1.9 // indirect

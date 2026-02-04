@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -157,12 +158,22 @@ func main() {
 		writeJSON(w, map[string]any{"authenticated": true, "provider": "claude-cli", "note": "Claude CLI uses local configuration"})
 	}))
 
-	mux.HandleFunc("/feishu/events", withCORS(func(w http.ResponseWriter, r *http.Request) {
-		feishu.HandleEvents(w, r)
-	}))
-	mux.HandleFunc("/feishu/callback", withCORS(func(w http.ResponseWriter, r *http.Request) {
-		feishu.HandleCardCallback(w, r)
-	}))
+	if cfg.FeishuEventMode == "http" || cfg.FeishuEventMode == "both" {
+		mux.HandleFunc("/feishu/events", withCORS(func(w http.ResponseWriter, r *http.Request) {
+			feishu.HandleEvents(w, r)
+		}))
+		mux.HandleFunc("/feishu/callback", withCORS(func(w http.ResponseWriter, r *http.Request) {
+			feishu.HandleCardCallback(w, r)
+		}))
+	}
+
+	if cfg.FeishuEventMode == "ws" || cfg.FeishuEventMode == "both" {
+		go func() {
+			if err := feishu.StartFeishuWS(context.Background()); err != nil {
+				log.Printf("[feishu] ws stopped: %v", err)
+			}
+		}()
+	}
 
 	log.Println("Claude Code Stream API Server")
 	log.Println("Listening on :6000")
