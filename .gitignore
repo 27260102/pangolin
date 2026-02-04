@@ -1,0 +1,10 @@
+*.db
+*.log
+*.out
+.env
+*.local
+/pangolin
+.DS_Store
+.idea
+.vscode
+projects.db
